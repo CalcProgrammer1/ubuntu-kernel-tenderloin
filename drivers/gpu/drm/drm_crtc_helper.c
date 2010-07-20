@@ -906,8 +906,11 @@ static void output_poll_execute(struct work_struct *work)
 			dev->mode_config.funcs->output_poll_changed(dev);
 	}
 
-	if (repoll)
-		queue_delayed_work(system_nrt_wq, delayed_work, DRM_OUTPUT_POLL_PERIOD);
+	if (repoll) {
+		ret = queue_delayed_work(system_nrt_wq, delayed_work, DRM_OUTPUT_POLL_PERIOD);
+		if (ret)
+			DRM_ERROR("delayed enqueue failed %d\n", ret);
+	}
 }
 
 void drm_kms_helper_poll_disable(struct drm_device *dev)
@@ -931,8 +934,16 @@ void drm_kms_helper_poll_enable(struct drm_device *dev)
 			poll = true;
 	}
 
+<<<<<<< HEAD
 	if (poll)
 		queue_delayed_work(system_nrt_wq, &dev->mode_config.output_poll_work, DRM_OUTPUT_POLL_PERIOD);
+=======
+	if (poll) {
+		ret = queue_delayed_work(system_nrt_wq, &dev->mode_config.output_poll_work, DRM_OUTPUT_POLL_PERIOD);
+		if (ret)
+			DRM_ERROR("delayed enqueue failed %d\n", ret);
+	}
+>>>>>>> drm: use workqueue instead of slow-work
 }
 EXPORT_SYMBOL(drm_kms_helper_poll_enable);
 
@@ -955,7 +966,6 @@ void drm_helper_hpd_irq_event(struct drm_device *dev)
 {
 	if (!dev->mode_config.poll_enabled)
 		return;
-
 	/* kill timer and schedule immediate execution, this doesn't block */
 	cancel_delayed_work(&dev->mode_config.output_poll_work);
 	if (drm_kms_helper_poll)

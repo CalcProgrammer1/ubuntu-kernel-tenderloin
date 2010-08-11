@@ -626,9 +626,12 @@ __SYSCALL(__NR_perf_event_open, sys_perf_event_open)
 __SYSCALL(__NR_accept4, sys_accept4)
 #define __NR_recvmmsg 243
 __SYSCALL(__NR_recvmmsg, sys_recvmmsg)
-
+#define __NR_fanotify_init 244
+__SYSCALL(__NR_fanotify_init, sys_fanotify_init)
+#define __NR_fanotify_mark 245
+__SYSCALL(__NR_fanotify_mark, sys_fanotify_mark)
 #undef __NR_syscalls
-#define __NR_syscalls 244
+#define __NR_syscalls 246
 
 /*
  * All syscalls below here should go away really,
@@ -766,6 +769,7 @@ __SYSCALL(__NR_vfork, sys_vfork)
 #define __NR_wait4 1072
 __SYSCALL(__NR_wait4, sys_wait4)
 #define __NR_recv 1073
+
 __SYSCALL(__NR_recv, sys_recv)
 #define __NR_send 1074
 __SYSCALL(__NR_send, sys_send)

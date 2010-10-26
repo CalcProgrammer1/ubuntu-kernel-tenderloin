@@ -48,21 +48,20 @@ int iomap_create_wc(resource_size_t base, unsigned long size, pgprot_t *prot)
 }
 EXPORT_SYMBOL_GPL(iomap_create_wc);
 
-void
-iomap_free(resource_size_t base, unsigned long size)
+void iomap_free(resource_size_t base, unsigned long size)
 {
 	io_free_memtype(base, base + size);
 }
 EXPORT_SYMBOL_GPL(iomap_free);
 
-void *kmap_atomic_prot_pfn(unsigned long pfn, enum km_type type, pgprot_t prot)
+void *kmap_atomic_prot_pfn(unsigned long pfn, pgprot_t prot)
 {
-	enum fixed_addresses idx;
 	unsigned long vaddr;
+	int idx, type;
 
 	pagefault_disable();
 
-	debug_kmap_atomic(type);
+	type = kmap_atomic_idx_push();
 	idx = type + KM_TYPE_NR * smp_processor_id();
 	vaddr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
 	set_pte(kmap_pte - idx, pfn_pte(pfn, prot));

@@ -17,6 +17,7 @@
 #include <asm/ioctls.h>
 
 #define FANOTIFY_DEFAULT_MAX_EVENTS	16384
+#define FANOTIFY_DEFAULT_MAX_MARKS	8192
 
 extern const struct fsnotify_ops fanotify_fsnotify_ops;
 
@@ -583,6 +584,9 @@ static int fanotify_add_vfsmount_mark(struct fsnotify_group *group,
 	if (!fsn_mark) {
 		int ret;
 
+		if (atomic_read(&group->num_marks) > group->fanotify_data.max_marks)
+			return -ENOSPC;
+
 		fsn_mark = kmem_cache_alloc(fanotify_mark_cache, GFP_KERNEL);
 		if (!fsn_mark)
 			return -ENOMEM;
@@ -624,6 +628,9 @@ static int fanotify_add_inode_mark(struct fsnotify_group *group,
 	fsn_mark = fsnotify_find_inode_mark(group, inode);
 	if (!fsn_mark) {
 		int ret;
+
+		if (atomic_read(&group->num_marks) > group->fanotify_data.max_marks)
+			return -ENOSPC;
 
 		fsn_mark = kmem_cache_alloc(fanotify_mark_cache, GFP_KERNEL);
 		if (!fsn_mark)
@@ -698,6 +705,8 @@ SYSCALL_DEFINE2(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
 	} else {
 		group->max_events = FANOTIFY_DEFAULT_MAX_EVENTS;
 	}
+
+	group->fanotify_data.max_marks = FANOTIFY_DEFAULT_MAX_MARKS;
 
 	fd = anon_inode_getfd("[fanotify]", &fanotify_fops, group, f_flags);
 	if (fd < 0)

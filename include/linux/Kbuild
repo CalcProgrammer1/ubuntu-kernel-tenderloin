@@ -68,6 +68,7 @@ header-y += elf-fdpic.h
 header-y += elf-em.h
 header-y += fadvise.h
 header-y += falloc.h
+header-y += fanotify.h
 header-y += fd.h
 header-y += fdreg.h
 header-y += fib_rules.h

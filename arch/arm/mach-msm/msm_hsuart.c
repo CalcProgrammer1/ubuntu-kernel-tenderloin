@@ -1405,10 +1405,7 @@ msm_hsuart_open_context(struct hsuart_config* io_p_cfg, int* o_p_context_id_hand
 					"hsuart_rd_dm_%d", 
 					context_cnt);
 			p_context->reader.p_worker = 
-				__create_workqueue(p_context->reader.name,
-							1,	/* singlethread */
-							0,	/* freezeable */
-							p_context->flags & HSUART_CFG_SCHED_RT);
+                                create_singlethread_workqueue(p_context->reader.name);
 			INIT_WORK(&(p_context->reader.worker), 
 					__msm_hsuart_read_dm_worker);
 		} else if (RX_MODE_PIO(p_context)) {
@@ -1421,10 +1418,7 @@ msm_hsuart_open_context(struct hsuart_config* io_p_cfg, int* o_p_context_id_hand
 					"hsuart_rd_pio_%d", 
 					context_cnt);
 			p_context->reader.p_worker = 
-				__create_workqueue(p_context->reader.name,
-							1,	/* singlethread */
-							0,	/* freezeable */
-							p_context->flags & HSUART_CFG_SCHED_RT);
+                                create_singlethread_workqueue(p_context->reader.name);
 
 			INIT_WORK(&(p_context->reader.worker), 
 					__msm_hsuart_read_pio_worker);
@@ -1440,10 +1434,7 @@ msm_hsuart_open_context(struct hsuart_config* io_p_cfg, int* o_p_context_id_hand
 					"hsuart_wr_%d", 
 					context_cnt);
 			p_context->writer.p_worker = 
-				__create_workqueue(p_context->reader.name,
-							1,	/* singlethread */
-							0,	/* freezeable */
-							p_context->flags & HSUART_CFG_SCHED_RT);
+                                create_singlethread_workqueue(p_context->reader.name);
 			INIT_WORK(&(p_context->writer.worker), 
 					__msm_hsuart_write_worker);
 

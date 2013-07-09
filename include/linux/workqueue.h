@@ -25,17 +25,19 @@ typedef void (*work_func_t)(struct work_struct *work);
 
 enum {
 	WORK_STRUCT_PENDING_BIT	= 0,	/* work item is pending execution */
-	WORK_STRUCT_LINKED_BIT	= 1,	/* next work is linked to this one */
+	WORK_STRUCT_CWQ_BIT	= 1,	/* data points to cwq */
+	WORK_STRUCT_LINKED_BIT	= 2,	/* next work is linked to this one */
 #ifdef CONFIG_DEBUG_OBJECTS_WORK
-	WORK_STRUCT_STATIC_BIT	= 2,	/* static initializer (debugobjects) */
-	WORK_STRUCT_COLOR_SHIFT	= 3,	/* color for workqueue flushing */
+	WORK_STRUCT_STATIC_BIT	= 3,	/* static initializer (debugobjects) */
+	WORK_STRUCT_COLOR_SHIFT	= 4,	/* color for workqueue flushing */
 #else
-	WORK_STRUCT_COLOR_SHIFT	= 2,	/* color for workqueue flushing */
+	WORK_STRUCT_COLOR_SHIFT	= 3,	/* color for workqueue flushing */
 #endif
 
 	WORK_STRUCT_COLOR_BITS	= 4,
 
 	WORK_STRUCT_PENDING	= 1 << WORK_STRUCT_PENDING_BIT,
+	WORK_STRUCT_CWQ		= 1 << WORK_STRUCT_CWQ_BIT,
 	WORK_STRUCT_LINKED	= 1 << WORK_STRUCT_LINKED_BIT,
 #ifdef CONFIG_DEBUG_OBJECTS_WORK
 	WORK_STRUCT_STATIC	= 1 << WORK_STRUCT_STATIC_BIT,
@@ -56,8 +58,8 @@ enum {
 	WORK_CPU_LAST		= WORK_CPU_NONE,
 
 	/*
-	 * Reserve 6 bits off of cwq pointer w/ debugobjects turned
-	 * off.  This makes cwqs aligned to 64 bytes which isn't too
+	 * Reserve 7 bits off of cwq pointer w/ debugobjects turned
+	 * off.  This makes cwqs aligned to 128 bytes which isn't too
 	 * excessive while allowing 15 workqueue flush colors.
 	 */
 	WORK_STRUCT_FLAG_BITS	= WORK_STRUCT_COLOR_SHIFT +
@@ -329,7 +331,6 @@ extern void init_workqueues(void);
 int execute_in_process_context(work_func_t fn, struct execute_work *);
 
 extern int flush_work(struct work_struct *work);
-
 extern int cancel_work_sync(struct work_struct *work);
 
 extern void workqueue_set_max_active(struct workqueue_struct *wq,
@@ -337,9 +338,6 @@ extern void workqueue_set_max_active(struct workqueue_struct *wq,
 extern bool workqueue_congested(unsigned int cpu, struct workqueue_struct *wq);
 extern unsigned int work_cpu(struct work_struct *work);
 extern unsigned int work_busy(struct work_struct *work);
-
-extern void dump_workqueue(struct workqueue_struct *wq);
-extern void dump_keventd_workqueue(void);
 
 /*
  * Kill off a pending schedule_delayed_work().  Note that the work callback

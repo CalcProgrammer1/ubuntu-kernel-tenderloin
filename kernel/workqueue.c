@@ -186,6 +186,27 @@ struct wq_flusher {
 };
 
 /*
+ * All cpumasks are assumed to be always set on UP and thus can't be
+ * used to determine whether there's something to be done.
+ */
+#ifdef CONFIG_SMP
+typedef cpumask_var_t mayday_mask_t;
+#define mayday_test_and_set_cpu(cpu, mask)	\
+	cpumask_test_and_set_cpu((cpu), (mask))
+#define mayday_clear_cpu(cpu, mask)		cpumask_clear_cpu((cpu), (mask))
+#define for_each_mayday_cpu(cpu, mask)		for_each_cpu((cpu), (mask))
+#define alloc_mayday_mask(maskp, gfp)		alloc_cpumask_var((maskp), (gfp))
+#define free_mayday_mask(mask)			free_cpumask_var((mask))
+#else
+typedef unsigned long mayday_mask_t;
+#define mayday_test_and_set_cpu(cpu, mask)	test_and_set_bit(0, &(mask))
+#define mayday_clear_cpu(cpu, mask)		clear_bit(0, &(mask))
+#define for_each_mayday_cpu(cpu, mask)		if ((cpu) = 0, (mask))
+#define alloc_mayday_mask(maskp, gfp)		true
+#define free_mayday_mask(mask)			do { } while (0)
+#endif
+
+/*
  * The externally visible workqueue abstraction is an array of
  * per-CPU workqueues:
  */
@@ -206,7 +227,7 @@ struct workqueue_struct {
 	struct list_head	flusher_queue;	/* F: flush waiters */
 	struct list_head	flusher_overflow; /* F: flush overflow list */
 
-	cpumask_var_t		mayday_mask;	/* cpus requesting rescue */
+	mayday_mask_t		mayday_mask;	/* cpus requesting rescue */
 	struct worker		*rescuer;	/* I: rescue worker */
 
 	int			saved_max_active; /* W: saved cwq max_active */
@@ -447,10 +468,9 @@ static int work_next_color(int color)
 }
 
 /*
- * Work data points to the cwq while a work is on queue.  Once
- * execution starts, it points to the cpu the work was last on.  This
- * can be distinguished by comparing the data value against
- * PAGE_OFFSET.
+ * A work's data points to the cwq with WORK_STRUCT_CWQ set while the
+ * work is on queue.  Once execution starts, WORK_STRUCT_CWQ is
+ * cleared and the work data contains the cpu number it was last on.
  *
  * set_work_{cwq|cpu}() and clear_work_data() can be used to set the
  * cwq, cpu or clear work->data.  These functions should only be
@@ -473,7 +493,7 @@ static void set_work_cwq(struct work_struct *work,
 			 unsigned long extra_flags)
 {
 	set_work_data(work, (unsigned long)cwq,
-		      WORK_STRUCT_PENDING | extra_flags);
+		      WORK_STRUCT_PENDING | WORK_STRUCT_CWQ | extra_flags);
 }
 
 static void set_work_cpu(struct work_struct *work, unsigned int cpu)
@@ -486,25 +506,24 @@ static void clear_work_data(struct work_struct *work)
 	set_work_data(work, WORK_STRUCT_NO_CPU, 0);
 }
 
-static inline unsigned long get_work_data(struct work_struct *work)
-{
-	return atomic_long_read(&work->data) & WORK_STRUCT_WQ_DATA_MASK;
-}
-
 static struct cpu_workqueue_struct *get_work_cwq(struct work_struct *work)
 {
-	unsigned long data = get_work_data(work);
+	unsigned long data = atomic_long_read(&work->data);
 
-	return data >= PAGE_OFFSET ? (void *)data : NULL;
+	if (data & WORK_STRUCT_CWQ)
+		return (void *)(data & WORK_STRUCT_WQ_DATA_MASK);
+	else
+		return NULL;
 }
 
 static struct global_cwq *get_work_gcwq(struct work_struct *work)
 {
-	unsigned long data = get_work_data(work);
+	unsigned long data = atomic_long_read(&work->data);
 	unsigned int cpu;
 
-	if (data >= PAGE_OFFSET)
-		return ((struct cpu_workqueue_struct *)data)->gcwq;
+	if (data & WORK_STRUCT_CWQ)
+		return ((struct cpu_workqueue_struct *)
+			(data & WORK_STRUCT_WQ_DATA_MASK))->gcwq;
 
 	cpu = data >> WORK_STRUCT_FLAG_BITS;
 	if (cpu == WORK_CPU_NONE)
@@ -512,128 +531,6 @@ static struct global_cwq *get_work_gcwq(struct work_struct *work)
 
 	BUG_ON(cpu >= nr_cpu_ids && cpu != WORK_CPU_UNBOUND);
 	return get_gcwq(cpu);
-}
-
-/**,
- * wq_worker_waking_up - a worker is waking up
- * @task: task waking up
- * @cpu: CPU @task is waking up to
- *
- * This function is called during try_to_wake_up() when a worker is
- * being awoken.
- *
- * CONTEXT:
- * spin_lock_irq(rq->lock)
- */
-void wq_worker_waking_up(struct task_struct *task, unsigned int cpu)
-{
-	struct worker *worker = kthread_data(task);
-
-	if (likely(!(worker->flags & WORKER_NOT_RUNNING)))
-		atomic_inc(get_gcwq_nr_running(cpu));
-}
-
-/**
- * wq_worker_sleeping - a worker is going to sleep
- * @task: task going to sleep
- * @cpu: CPU in question, must be the current CPU number
- *
- * This function is called during schedule() when a busy worker is
- * going to sleep.  Worker on the same cpu can be woken up by
- * returning pointer to its task.
- *
- * CONTEXT:
- * spin_lock_irq(rq->lock)
- *
- * RETURNS:
- * Worker task on @cpu to wake up, %NULL if none.
- */
-struct task_struct *wq_worker_sleeping(struct task_struct *task,
-				       unsigned int cpu)
-{
-	struct worker *worker = kthread_data(task), *to_wakeup = NULL;
-	struct global_cwq *gcwq = get_gcwq(cpu);
-	atomic_t *nr_running = get_gcwq_nr_running(cpu);
-
-	if (unlikely(worker->flags & WORKER_NOT_RUNNING))
-		return NULL;
-
-	/* this can only happen on the local cpu */
-	BUG_ON(cpu != raw_smp_processor_id());
-
-	/*
-	 * The counterpart of the following dec_and_test, implied mb,
-	 * worklist not empty test sequence is in insert_work().
-	 * Please read comment there.
-	 *
-	 * NOT_RUNNING is clear.  This means that trustee is not in
-	 * charge and we're running on the local cpu w/ rq lock held
-	 * and preemption disabled, which in turn means that none else
-	 * could be manipulating idle_list, so dereferencing idle_list
-	 * without gcwq lock is safe.
-	 */
-	if (atomic_dec_and_test(nr_running) && !list_empty(&gcwq->worklist))
-		to_wakeup = first_worker(gcwq);
-	return to_wakeup ? to_wakeup->task : NULL;
-}
-
-/**
- * worker_set_flags - set worker flags
- * @worker: worker to set flags for
- * @flags: flags to set
- * @wakeup: wakeup an idle worker if necessary
- *
- * Set @flags in @worker->flags.
- *
- * LOCKING:
- * spin_lock_irq(gcwq->lock).
- */
-static inline void worker_set_flags(struct worker *worker, unsigned int flags,
-				    bool wakeup)
-{
-	struct global_cwq *gcwq = worker->gcwq;
-
-	/*
-	 * If transitioning into NOT_RUNNING, adjust nr_running and
-	 * wake up an idle worker as necessary if requested by
-	 * @wakeup.
-	 */
-	if ((flags & WORKER_NOT_RUNNING) &&
-	    !(worker->flags & WORKER_NOT_RUNNING)) {
-		atomic_t *nr_running = get_gcwq_nr_running(gcwq->cpu);
-
-		if (wakeup) {
-			if (atomic_dec_and_test(nr_running) &&
-			    !list_empty(&gcwq->worklist))
-				wake_up_worker(gcwq);
-		} else
-			atomic_dec(nr_running);
-	}
-
-	worker->flags |= flags;
-}
-
-/**
- * worker_clr_flags - clear worker flags and adjust nr_running accordingly.
- * @worker: worker to set flags for
- * @flags: flags to clear
- *
- * Clear @flags in @worker->flags.and adjust nr_running accordingly.
- *
- * LOCKING:
- * spin_lock_irq(gcwq->lock).
- */
-static inline void worker_clr_flags(struct worker *worker, unsigned int flags)
-{
-	struct global_cwq *gcwq = worker->gcwq;
-	unsigned int oflags = worker->flags;
-
-	worker->flags &= ~flags;
-
-	/* if transitioning out of NOT_RUNNING, increment nr_running */
-	if ((flags & WORKER_NOT_RUNNING) && (oflags & WORKER_NOT_RUNNING))
-		if (!(worker->flags & WORKER_NOT_RUNNING))
-			atomic_inc(get_gcwq_nr_running(gcwq->cpu));
 }
 
 /*
@@ -721,6 +618,134 @@ static void wake_up_worker(struct global_cwq *gcwq)
 
 	if (likely(worker))
 		wake_up_process(worker->task);
+}
+
+/**
+ * wq_worker_waking_up - a worker is waking up
+ * @task: task waking up
+ * @cpu: CPU @task is waking up to
+ *
+ * This function is called during try_to_wake_up() when a worker is
+ * being awoken.
+ *
+ * CONTEXT:
+ * spin_lock_irq(rq->lock)
+ */
+void wq_worker_waking_up(struct task_struct *task, unsigned int cpu)
+{
+	struct worker *worker = kthread_data(task);
+
+	if (likely(!(worker->flags & WORKER_NOT_RUNNING)))
+		atomic_inc(get_gcwq_nr_running(cpu));
+}
+
+/**
+ * wq_worker_sleeping - a worker is going to sleep
+ * @task: task going to sleep
+ * @cpu: CPU in question, must be the current CPU number
+ *
+ * This function is called during schedule() when a busy worker is
+ * going to sleep.  Worker on the same cpu can be woken up by
+ * returning pointer to its task.
+ *
+ * CONTEXT:
+ * spin_lock_irq(rq->lock)
+ *
+ * RETURNS:
+ * Worker task on @cpu to wake up, %NULL if none.
+ */
+struct task_struct *wq_worker_sleeping(struct task_struct *task,
+				       unsigned int cpu)
+{
+	struct worker *worker = kthread_data(task), *to_wakeup = NULL;
+	struct global_cwq *gcwq = get_gcwq(cpu);
+	atomic_t *nr_running = get_gcwq_nr_running(cpu);
+
+	if (unlikely(worker->flags & WORKER_NOT_RUNNING))
+		return NULL;
+
+	/* this can only happen on the local cpu */
+	BUG_ON(cpu != raw_smp_processor_id());
+
+	/*
+	 * The counterpart of the following dec_and_test, implied mb,
+	 * worklist not empty test sequence is in insert_work().
+	 * Please read comment there.
+	 *
+	 * NOT_RUNNING is clear.  This means that trustee is not in
+	 * charge and we're running on the local cpu w/ rq lock held
+	 * and preemption disabled, which in turn means that none else
+	 * could be manipulating idle_list, so dereferencing idle_list
+	 * without gcwq lock is safe.
+	 */
+	if (atomic_dec_and_test(nr_running) && !list_empty(&gcwq->worklist))
+		to_wakeup = first_worker(gcwq);
+	return to_wakeup ? to_wakeup->task : NULL;
+}
+
+/**
+ * worker_set_flags - set worker flags and adjust nr_running accordingly
+ * @worker: self
+ * @flags: flags to set
+ * @wakeup: wakeup an idle worker if necessary
+ *
+ * Set @flags in @worker->flags and adjust nr_running accordingly.  If
+ * nr_running becomes zero and @wakeup is %true, an idle worker is
+ * woken up.
+ *
+ * CONTEXT:
+ * spin_lock_irq(gcwq->lock)
+ */
+static inline void worker_set_flags(struct worker *worker, unsigned int flags,
+				    bool wakeup)
+{
+	struct global_cwq *gcwq = worker->gcwq;
+
+	WARN_ON_ONCE(worker->task != current);
+
+	/*
+	 * If transitioning into NOT_RUNNING, adjust nr_running and
+	 * wake up an idle worker as necessary if requested by
+	 * @wakeup.
+	 */
+	if ((flags & WORKER_NOT_RUNNING) &&
+	    !(worker->flags & WORKER_NOT_RUNNING)) {
+		atomic_t *nr_running = get_gcwq_nr_running(gcwq->cpu);
+
+		if (wakeup) {
+			if (atomic_dec_and_test(nr_running) &&
+			    !list_empty(&gcwq->worklist))
+				wake_up_worker(gcwq);
+		} else
+			atomic_dec(nr_running);
+	}
+
+	worker->flags |= flags;
+}
+
+/**
+ * worker_clr_flags - clear worker flags and adjust nr_running accordingly
+ * @worker: self
+ * @flags: flags to clear
+ *
+ * Clear @flags in @worker->flags and adjust nr_running accordingly.
+ *
+ * CONTEXT:
+ * spin_lock_irq(gcwq->lock)
+ */
+static inline void worker_clr_flags(struct worker *worker, unsigned int flags)
+{
+	struct global_cwq *gcwq = worker->gcwq;
+	unsigned int oflags = worker->flags;
+
+	WARN_ON_ONCE(worker->task != current);
+
+	worker->flags &= ~flags;
+
+	/* if transitioning out of NOT_RUNNING, increment nr_running */
+	if ((flags & WORKER_NOT_RUNNING) && (oflags & WORKER_NOT_RUNNING))
+		if (!(worker->flags & WORKER_NOT_RUNNING))
+			atomic_inc(get_gcwq_nr_running(gcwq->cpu));
 }
 
 /**
@@ -1089,7 +1114,8 @@ static void worker_enter_idle(struct worker *worker)
 	BUG_ON(!list_empty(&worker->entry) &&
 	       (worker->hentry.next || worker->hentry.pprev));
 
-	worker_set_flags(worker, WORKER_IDLE, false);
+	/* can't use worker_set_flags(), also called from start_worker() */
+	worker->flags |= WORKER_IDLE;
 	gcwq->nr_idle++;
 	worker->last_active = jiffies;
 
@@ -1102,6 +1128,10 @@ static void worker_enter_idle(struct worker *worker)
 				  jiffies + IDLE_WORKER_TIMEOUT);
 	} else
 		wake_up_all(&gcwq->trustee_wait);
+
+	/* sanity check nr_running */
+	WARN_ON_ONCE(gcwq->nr_workers == gcwq->nr_idle &&
+		     atomic_read(get_gcwq_nr_running(gcwq->cpu)));
 }
 
 /**
@@ -1295,7 +1325,7 @@ fail:
  */
 static void start_worker(struct worker *worker)
 {
-	worker_set_flags(worker, WORKER_STARTED, false);
+	worker->flags |= WORKER_STARTED;
 	worker->gcwq->nr_workers++;
 	worker_enter_idle(worker);
 	wake_up_process(worker->task);
@@ -1325,7 +1355,7 @@ static void destroy_worker(struct worker *worker)
 		gcwq->nr_idle--;
 
 	list_del_init(&worker->entry);
-	worker_set_flags(worker, WORKER_DIE, false);
+	worker->flags |= WORKER_DIE;
 
 	spin_unlock_irq(&gcwq->lock);
 
@@ -1376,7 +1406,7 @@ static bool send_mayday(struct work_struct *work)
 	/* WORK_CPU_UNBOUND can't be set in cpumask, use cpu 0 instead */
 	if (cpu == WORK_CPU_UNBOUND)
 		cpu = 0;
-	if (!cpumask_test_and_set_cpu(cpu, wq->mayday_mask))
+	if (!mayday_test_and_set_cpu(cpu, wq->mayday_mask))
 		wake_up_process(wq->rescuer->task);
 	return true;
 }
@@ -1789,18 +1819,14 @@ static void process_scheduled_works(struct worker *worker)
  * their specific target workqueue.  The only exception is works which
  * belong to workqueues with a rescuer which will be explained in
  * rescuer_thread().
-
  */
 static int worker_thread(void *__worker)
 {
 	struct worker *worker = __worker;
 	struct global_cwq *gcwq = worker->gcwq;
 
-        set_user_nice(current, -5);
-
 	/* tell the scheduler that this is a workqueue worker */
 	worker->task->flags |= PF_WQ_WORKER;
-
 woke_up:
 	spin_lock_irq(&gcwq->lock);
 
@@ -1852,10 +1878,10 @@ recheck:
 	} while (keep_working(gcwq));
 
 	worker_set_flags(worker, WORKER_PREP, false);
-
+sleep:
 	if (unlikely(need_to_manage_workers(gcwq)) && manage_workers(worker))
 		goto recheck;
-sleep:
+
 	/*
 	 * gcwq->lock is held and there's no work to process and no
 	 * need to manage, sleep.  Workers are woken up only while
@@ -1908,14 +1934,14 @@ repeat:
 	 * See whether any cpu is asking for help.  Unbounded
 	 * workqueues use cpu 0 in mayday_mask for CPU_UNBOUND.
 	 */
-	for_each_cpu(cpu, wq->mayday_mask) {
+	for_each_mayday_cpu(cpu, wq->mayday_mask) {
 		unsigned int tcpu = is_unbound ? WORK_CPU_UNBOUND : cpu;
 		struct cpu_workqueue_struct *cwq = get_cwq(tcpu, wq);
 		struct global_cwq *gcwq = cwq->gcwq;
 		struct work_struct *work, *n;
 
 		__set_current_state(TASK_RUNNING);
-		cpumask_clear_cpu(cpu, wq->mayday_mask);
+		mayday_clear_cpu(cpu, wq->mayday_mask);
 
 		/* migrate to the target cpu if possible */
 		rescuer->gcwq = gcwq;
@@ -2163,6 +2189,10 @@ void flush_workqueue(struct workqueue_struct *wq)
 		return;
 
 	mutex_lock(&wq->flush_mutex);
+
+	/* we might have raced, check again with mutex held */
+	if (wq->first_flusher != &this_flusher)
+		goto out_unlock;
 
 	wq->first_flusher = NULL;
 
@@ -2594,60 +2624,6 @@ int keventd_up(void)
 	return system_wq != NULL;
 }
 
-/*
- * dump workqueue contents
- */
-void dump_workqueue(struct workqueue_struct *wq)
-{
-	const struct cpumask *cpu_map = wq_cpu_map(wq);
-	struct cpu_workqueue_struct *cwq;
-	unsigned long flags;
-	int cpu;
-
-	if (!wq)
-		return;
-
-	for_each_cpu(cpu, cpu_map) {
-		cwq = per_cpu_ptr(wq->cpu_wq, cpu);
-
-		printk(KERN_INFO "Workqueue dump for CPU %d\n", cpu);
-
-		spin_lock_irqsave(&cwq->lock, flags);
-
-		if (!list_empty(&cwq->worklist)) {
-			struct work_struct *work = cwq->current_work;
-			int i = 0;
-
-			printk(KERN_INFO " Current work: ");
-			print_symbol("%s/", (unsigned long)work->func);
-			printk(KERN_INFO "%lx, pending(%d)",
-				(unsigned long)work->func,
-				work_pending(work));
-
-			list_for_each_entry(work, &cwq->worklist, entry) {
-				printk(KERN_INFO "  CWQ(%d/%d) ", cpu, i++);
-				print_symbol("%s/", (unsigned long)work->func);
-				printk(KERN_INFO "%lx, pending(%d)",
-					(unsigned long)work->func,
-					work_pending(work));
-			}
-		} else {
-			printk(KERN_INFO "  workqueue is empty\n");
-		}
-		spin_unlock_irqrestore(&cwq->lock, flags);
-	}
-}
-EXPORT_SYMBOL(dump_workqueue);
-
-/*
- * dump_keventd_workqueue
- */
-void dump_keventd_workqueue(void)
-{
-	dump_workqueue(keventd_wq);
-}
-EXPORT_SYMBOL(dump_keventd_workqueue);
-
 static int alloc_cwqs(struct workqueue_struct *wq)
 {
 	/*
@@ -2767,7 +2743,7 @@ struct workqueue_struct *__alloc_workqueue_key(const char *name,
 	if (flags & WQ_RESCUER) {
 		struct worker *rescuer;
 
-		if (!alloc_cpumask_var(&wq->mayday_mask, GFP_KERNEL))
+		if (!alloc_mayday_mask(&wq->mayday_mask, GFP_KERNEL))
 			goto err;
 
 		wq->rescuer = rescuer = alloc_worker();
@@ -2802,7 +2778,7 @@ struct workqueue_struct *__alloc_workqueue_key(const char *name,
 err:
 	if (wq) {
 		free_cwqs(wq);
-		free_cpumask_var(wq->mayday_mask);
+		free_mayday_mask(wq->mayday_mask);
 		kfree(wq->rescuer);
 		kfree(wq);
 	}
@@ -2843,7 +2819,7 @@ void destroy_workqueue(struct workqueue_struct *wq)
 
 	if (wq->flags & WQ_RESCUER) {
 		kthread_stop(wq->rescuer->task);
-		free_cpumask_var(wq->mayday_mask);
+		free_mayday_mask(wq->mayday_mask);
 	}
 
 	free_cwqs(wq);
@@ -3083,10 +3059,10 @@ static int __cpuinit trustee_thread(void *__gcwq)
 	gcwq->flags |= GCWQ_MANAGING_WORKERS;
 
 	list_for_each_entry(worker, &gcwq->idle_list, entry)
-		worker_set_flags(worker, WORKER_ROGUE, false);
+		worker->flags |= WORKER_ROGUE;
 
 	for_each_busy_worker(worker, i, pos, gcwq)
-		worker_set_flags(worker, WORKER_ROGUE, false);
+		worker->flags |= WORKER_ROGUE;
 
 	/*
 	 * Call schedule() so that we cross rq->lock and thus can
@@ -3099,12 +3075,12 @@ static int __cpuinit trustee_thread(void *__gcwq)
 	spin_lock_irq(&gcwq->lock);
 
 	/*
-	 * Sched callbacks are disabled now.  gcwq->nr_running should
-	 * be zero and will stay that way, making need_more_worker()
-	 * and keep_working() always return true as long as the
-	 * worklist is not empty.
+	 * Sched callbacks are disabled now.  Zap nr_running.  After
+	 * this, nr_running stays zero and need_more_worker() and
+	 * keep_working() are always true as long as the worklist is
+	 * not empty.
 	 */
-	WARN_ON_ONCE(atomic_read(get_gcwq_nr_running(gcwq->cpu)) != 0);
+	atomic_set(get_gcwq_nr_running(gcwq->cpu), 0);
 
 	spin_unlock_irq(&gcwq->lock);
 	del_timer_sync(&gcwq->idle_timer);
@@ -3150,7 +3126,7 @@ static int __cpuinit trustee_thread(void *__gcwq)
 			worker = create_worker(gcwq, false);
 			spin_lock_irq(&gcwq->lock);
 			if (worker) {
-				worker_set_flags(worker, WORKER_ROGUE, false);
+				worker->flags |= WORKER_ROGUE;
 				start_worker(worker);
 			}
 		}
@@ -3189,8 +3165,8 @@ static int __cpuinit trustee_thread(void *__gcwq)
 		 * operations.  Use a separate flag to mark that
 		 * rebinding is scheduled.
 		 */
-		worker_set_flags(worker, WORKER_REBIND, false);
-		worker_clr_flags(worker, WORKER_ROGUE);
+		worker->flags |= WORKER_REBIND;
+		worker->flags &= ~WORKER_ROGUE;
 
 		/* queue rebind_work, wq doesn't matter, use the default one */
 		if (test_and_set_bit(WORK_STRUCT_PENDING_BIT,
@@ -3522,14 +3498,6 @@ void __init init_workqueues(void)
 {
 	unsigned int cpu;
 	int i;
-
-	/*
-	 * The pointer part of work->data is either pointing to the
-	 * cwq or contains the cpu number the work ran last on.  Make
-	 * sure cpu number won't overflow into kernel pointer area so
-	 * that they can be distinguished.
-	 */
-	BUILD_BUG_ON(WORK_CPU_LAST << WORK_STRUCT_FLAG_BITS >= PAGE_OFFSET);
 
 	hotcpu_notifier(workqueue_cpu_callback, CPU_PRI_WORKQUEUE);
 

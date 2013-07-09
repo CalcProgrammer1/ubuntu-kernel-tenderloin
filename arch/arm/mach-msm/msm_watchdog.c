@@ -267,7 +267,7 @@ static int __init init_watchdog(void)
 	if (ret)
 		return ret;
 
-	msm_wdog_wq = create_rt_workqueue("msm_wdog_wq");
+	msm_wdog_wq = create_singlethread_workqueue("msm_wdog_wq");
 	if (!msm_wdog_wq) {
 		printk(KERN_ERR "Creation of msm_wdog_wq failed!!\n");
 		return -EINVAL;

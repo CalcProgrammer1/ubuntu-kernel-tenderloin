@@ -541,7 +541,7 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		break;
 
 	default:
-		pr_err("error: rmnet_ioct called for unsupported cnd %d", cmd);
+		//pr_err("error: rmnet_ioct called for unsupported cnd %d", cmd);
 		return -EINVAL;
 	}
 

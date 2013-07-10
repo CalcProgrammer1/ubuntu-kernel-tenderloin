@@ -378,7 +378,6 @@
 		CALL(sys_accept4)
 		CALL(sys_fanotify_init)
 		CALL(sys_fanotify_mark)
-		CALL(sys_prlimit64)
 #ifndef syscalls_counted
 .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
 #define syscalls_counted
